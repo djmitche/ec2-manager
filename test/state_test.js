@@ -4,11 +4,13 @@ const assume = require('assume');
 
 describe('State', () => {
   let db;
+  let knex;
   let defaultInst;
   let defaultSR;
 
   before(async () => {
-    db = await main('state', {profile: 'test', process: 'test'});
+    knex = await main('knex', {profile: 'test', process: 'test'});
+    db = await main('state', {profile: 'test', process: 'test', knex});
     await db._runScript('drop-db.sql');
     await db._runScript('create-db.sql');
   });
@@ -47,23 +49,22 @@ describe('State', () => {
 
   describe('type parsers', () => {
     it('should parse ints (20) to js ints', async () => {
-      let result = await db._pgpool.query('SELECT count(id) FROM instances;');
-      assume(result).has.property('rows');
-      assume(result.rows).has.lengthOf(1);
-      assume(result.rows[0]).has.property('count', 0);
+      let result = await knex.select({count: knex.raw('count(id)')}).from('instances');
+      assume(result).has.lengthOf(1);
+      assume(result[0]).has.property('count', 0);
     });
 
     it('should parse timestamptz (1184) to js dates (UTC)', async () => {
       let d = new Date(0);
-      let result = await db._pgpool.query('SELECT timestamptz \'1970-1-1 UTC\' as a;');
-      let {a} = result.rows[0];
+      let result = await knex.select({a: knex.raw('timestamptz \'1970-1-1 UTC\'')});
+      let {a} = result[0];
       assume(d.getTime()).equals(a.getTime());
     });
 
     it('should parse timestamptz (1184) to js dates (CEST)', async () => {
       let d = new Date('Tue Jul 04 2017 1:00:00 GMT+0200 (CEST)');
-      let result = await db._pgpool.query('SELECT timestamptz \'2017-7-4 1:00:00 CEST\' as a;');
-      let {a} = result.rows[0];
+      let result = await knex.select({a: knex.raw('timestamptz \'2017-7-4 1:00:00 CEST\'')});
+      let {a} = result[0];
       assume(d.getTime()).equals(a.getTime());
     });
   });
@@ -72,53 +73,38 @@ describe('State', () => {
     let table = 'junk';
 
     it('no conditions', () => {
-      let expected = {text: 'SELECT * FROM junk;', values: []};
-      let actual = db._generateTableListQuery(table);
+      let expected = 'select * from "junk"';
+      let actual = db._generateTableListQuery(table).toString();
       assume(expected).deeply.equals(actual);
     });
 
     it('one flat condition', () => {
-      let expected = {
-        text: 'SELECT * FROM junk WHERE junk.a = $1;',
-        values: ['aye'],
-      };
-      let actual = db._generateTableListQuery(table, {a: 'aye'});
+      let expected = 'select * from "junk" where "a" = \'aye\'';
+      let actual = db._generateTableListQuery(table, {a: 'aye'}).toString();
       assume(expected).deeply.equals(actual);
     });
 
     it('two flat conditions', () => {
-      let expected = {
-        text: 'SELECT * FROM junk WHERE junk.a = $1 AND junk.b = $2;',
-        values: ['aye', 'bee'],
-      };
-      let actual = db._generateTableListQuery(table, {a: 'aye', b: 'bee'});
+      let expected = 'select * from "junk" where "a" = \'aye\' and "b" = \'bee\'';
+      let actual = db._generateTableListQuery(table, {a: 'aye', b: 'bee'}).toString();
       assume(expected).deeply.equals(actual);
     });
 
     it('one list condition', () => {
-      let expected = {
-        text: 'SELECT * FROM junk WHERE junk.a = $1 OR junk.a = $2 OR junk.a = $3;',
-        values: ['a', 'b', 'c'],
-      };
-      let actual = db._generateTableListQuery(table, {a: ['a', 'b', 'c']});
+      let expected = 'select * from "junk" where "a" in (\'a\', \'b\', \'c\')';
+      let actual = db._generateTableListQuery(table, {a: ['a', 'b', 'c']}).toString();
       assume(expected).deeply.equals(actual);
     });
 
     it('two list conditions', () => {
-      let expected = {
-        text: 'SELECT * FROM junk WHERE (junk.a = $1 OR junk.a = $2) AND (junk.b = $3 OR junk.b = $4);',
-        values: ['a', 'b', 'c', 'd'],
-      };
-      let actual = db._generateTableListQuery(table, {a: ['a', 'b'], b: ['c', 'd']});
+      let expected = 'select * from "junk" where "a" in (\'a\', \'b\') and "b" in (\'c\', \'d\')';
+      let actual = db._generateTableListQuery(table, {a: ['a', 'b'], b: ['c', 'd']}).toString();
       assume(expected).deeply.equals(actual);
     });
 
     it('mixed type flat-list-flat conditions', () => {
-      let expected = {
-        text: 'SELECT * FROM junk WHERE junk.a = $1 AND (junk.b = $2 OR junk.b = $3) AND junk.c = $4;',
-        values: ['a', 'b', 'c', 'd'],
-      };
-      let actual = db._generateTableListQuery(table, {a: 'a', b: ['b', 'c'], c: 'd'});
+      let expected = 'select * from "junk" where "a" = \'a\' and "b" in (\'b\', \'c\') and "c" = \'d\'';
+      let actual = db._generateTableListQuery(table, {a: 'a', b: ['b', 'c'], c: 'd'}).toString();
       assume(expected).deeply.equals(actual);
     });
 
@@ -442,6 +428,9 @@ describe('State', () => {
       ],
     };
     let actual = await db.listIdsOfWorkerType({workerType: defaultInst.workerType});
+    // sort to avoid depending on DB ordering
+    actual.instanceIds.sort((a, b) => a.id < b.id ? -1 : 1);
+    actual.requestIds.sort((a, b) => a.id < b.id ? -1 : 1);
     assume(expected).deeply.equals(actual);
   });
 
@@ -453,10 +442,9 @@ describe('State', () => {
       state: 'pending',
       generated: time,
     });
-    let client = await db.getClient();
-    let result = await client.query('select * from cloudwatchlog');
-    assume(result.rows).has.lengthOf(1);
-    let row = result.rows[0];
+    let result = await knex.from('cloudwatchlog');
+    assume(result).has.lengthOf(1);
+    let row = result[0];
     assume(row).has.property('region', defaultInst.region);
     assume(row).has.property('id', defaultInst.id);
     assume(row).has.property('state', 'pending');
